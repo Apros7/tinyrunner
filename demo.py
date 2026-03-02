@@ -55,10 +55,10 @@ def _download_coco128():
     z.extractall(os.path.dirname(COCO128_DIR))
   os.rename(os.path.join(os.path.dirname(COCO128_DIR), "coco128"), COCO128_DIR)
   os.remove(zip_path)
-  # COCO128 uses 'images/train2017' — create data.yaml if missing
+  # COCO128 ships its own data.yaml with absolute paths baked in for the
+  # ultralytics machine — always overwrite with our actual paths.
   yaml_path = os.path.join(COCO128_DIR, "data.yaml")
-  if not os.path.exists(yaml_path):
-    _write_coco128_yaml(yaml_path)
+  _write_coco128_yaml(yaml_path)
   print(f"  Saved to {COCO128_DIR}", flush=True)
   return COCO128_DIR
 
@@ -93,12 +93,12 @@ def _write_coco128_yaml(yaml_path):
     f.write(f"names: {names}\n")
 
 
-def _find_split(data_path, split_names):
+def _find_split(data_path, split_names, img_size=640):
   """Try multiple split directory names, return dataset or None."""
   from tinyrunner.data import load_dataset
   for name in split_names:
     try:
-      return load_dataset(data_path, split=name, img_size=None, training=False)
+      return load_dataset(data_path, split=name, img_size=img_size, training=False)
     except Exception:
       pass
   return None
@@ -201,7 +201,7 @@ def main():
   print(f"\n── Dataset: {data_path}", flush=True)
   train_ds = load_dataset(data_path, split="train", img_size=args.img_size, training=True)
   print(f"  train : {len(train_ds)} images, {train_ds.num_classes} classes")
-  val_ds = _find_split(data_path, ["valid", "val", "validation", "test"])
+  val_ds = _find_split(data_path, ["valid", "val", "validation", "test"], img_size=args.img_size)
   if val_ds:
     print(f"  val   : {len(val_ds)} images")
   else:

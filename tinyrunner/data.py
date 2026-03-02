@@ -89,15 +89,54 @@ class YOLODataset:
   """Loads YOLOv8-format dataset. images/ and labels/ subdirs with txt files."""
   def __init__(self, data_dir, split="train", img_size=640, training=True):
     self.img_size = img_size; self.training = training
-    img_dir = os.path.join(data_dir, split, "images")
-    lbl_dir = os.path.join(data_dir, split, "labels")
-    # parse data.yaml for class count
+    # parse data.yaml for class count and optional split paths
     yaml_path = os.path.join(data_dir, "data.yaml")
     self.num_classes = 80
+    yaml_root = data_dir  # 'path:' field in yaml, if present
+    yaml_splits = {}      # e.g. {"train": "images/train2017", "val": "images/val2017"}
     if os.path.exists(yaml_path):
       with open(yaml_path) as f:
         for line in f:
-          if line.startswith("nc:"): self.num_classes = int(line.split(":")[1]); break
+          line = line.rstrip()
+          if line.startswith("nc:"):
+            try: self.num_classes = int(line.split(":", 1)[1].strip())
+            except ValueError: pass
+          elif line.startswith("path:"):
+            p = line.split(":", 1)[1].strip()
+            if os.path.isabs(p):
+              yaml_root = p if os.path.isdir(p) else data_dir
+            else:
+              yaml_root = os.path.join(data_dir, p)
+          elif line.startswith(("train:", "val:", "valid:", "test:", "validation:")):
+            key, val = line.split(":", 1)
+            yaml_splits[key.strip()] = val.strip()
+    # resolve split aliases
+    split_aliases = {
+      "train": ["train"],
+      "val":   ["val", "valid", "validation"],
+      "test":  ["test"],
+    }
+    img_dir = None
+    for alias in split_aliases.get(split, [split]):
+      if alias in yaml_splits:
+        rel = yaml_splits[alias]
+        candidate = rel if os.path.isabs(rel) else os.path.join(yaml_root, rel)
+        if os.path.isdir(candidate):
+          img_dir = candidate; break
+    # fallback: conventional {data_dir}/{split}/images or {data_dir}/{split}
+    if img_dir is None:
+      for candidate in [
+        os.path.join(data_dir, split, "images"),
+        os.path.join(data_dir, split),
+      ]:
+        if os.path.isdir(candidate): img_dir = candidate; break
+    if img_dir is None:
+      raise FileNotFoundError(f"Could not find images for split '{split}' in {data_dir}")
+    # derive labels dir: images/train2017 → labels/train2017, or sibling labels/
+    lbl_dir = img_dir.replace(os.sep + "images" + os.sep, os.sep + "labels" + os.sep)
+    if lbl_dir == img_dir:  # no replacement happened
+      lbl_dir = os.path.join(os.path.dirname(img_dir), "labels",
+                             os.path.basename(img_dir))
     self.samples = []
     for fname in sorted(os.listdir(img_dir)):
       if not fname.lower().endswith((".jpg", ".jpeg", ".png")): continue
@@ -144,10 +183,10 @@ def make_loader(dataset, batch_size, shuffle=True):
 
 def load_dataset(data_path, split="train", img_size=640, training=True):
   """Auto-detect COCO JSON or YOLO format."""
-  # YOLO: has data.yaml or train/images/ dir
+  # YOLO: has data.yaml, or conventional {split}/images/ dir
   yaml = os.path.join(data_path, "data.yaml")
   split_img_dir = os.path.join(data_path, split, "images")
-  if os.path.exists(yaml) or os.path.exists(split_img_dir):
+  if os.path.exists(yaml) or os.path.isdir(split_img_dir):
     return YOLODataset(data_path, split, img_size, training)
   # COCO: look for annotations json
   for candidate in ["annotations/instances_train2017.json", "train.json", f"{split}.json",
