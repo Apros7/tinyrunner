@@ -12,15 +12,29 @@ import numpy as np
 # ── CUDA auto-detection (must happen before tinygrad import) ──────────────────
 def _detect_device():
   if os.environ.get("CUDA") or os.environ.get("GPU"):
+    _ensure_cuda_ptx()
     return "CUDA"
   try:
     r = subprocess.run(["nvidia-smi"], capture_output=True, timeout=5)
     if r.returncode == 0:
       os.environ["CUDA"] = "1"
+      _ensure_cuda_ptx()
       return "CUDA"
   except (FileNotFoundError, subprocess.TimeoutExpired):
     pass
   return "CLANG"
+
+
+def _ensure_cuda_ptx():
+  """Set CUDA_PTX=1 unless the user has already set a compiler preference.
+
+  tinygrad's default CUDA path uses nvrtc to compile to SASS, but nvrtc may
+  reject the GPU's arch string (e.g. sm_100 on older CUDA toolkits).
+  CUDA_PTX=1 bypasses nvrtc: tinygrad emits PTX text, which the CUDA driver
+  JIT-compiles at load time.  Works on all CUDA-capable GPUs.
+  """
+  if not os.environ.get("CUDA_PTX") and not os.environ.get("CUDA_CC"):
+    os.environ["CUDA_PTX"] = "1"
 
 DEVICE = _detect_device()
 
