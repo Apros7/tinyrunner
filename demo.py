@@ -9,33 +9,35 @@ tinyrunner demo — train RF-DETR, evaluate mAP, compare against benchmarks.
 import argparse, os, sys, time, subprocess, urllib.request, zipfile, shutil
 import numpy as np
 
-# ── GPU auto-detection (must happen before tinygrad import) ───────────────────
+# ── CUDA auto-detection (must happen before tinygrad import) ──────────────────
 def _detect_device():
-  """Detect NVIDIA GPU and set the best tinygrad backend.
+  """Detect NVIDIA GPU and configure tinygrad's CUDA backend.
 
-  Prefers NV=1 over CUDA=1.  The NV backend (ops_nv.py) uses tinygrad's
-  direct-hardware NVIDIA path: it queries GPU arch from hardware registers
-  (not the CUDA driver), handles newer GPU variants correctly, and runs
-  kernels via direct memory-mapped queues — all of which show up as real
-  GPU utilization in nvidia-smi.
-
-  Falls back to CUDA=1 if the user set it explicitly, and to CLANG on
-  non-NVIDIA systems.
+  Sets CUDA_PTX=1 so tinygrad uses PTXCompiler (pure Python text substitution)
+  instead of nvrtc.  nvrtc rejects newer GPU arch strings (e.g. sm_100 for
+  Blackwell) on older CUDA toolkits.  PTXCompiler produces PTX text which is
+  handed directly to the CUDA *driver* via cuModuleLoadData — the driver always
+  supports its own GPU and JIT-compiles the PTX at first use, caching the
+  result in ~/.nv/ComputeCache/ for all subsequent runs.
   """
-  # Respect explicit user choice
-  if os.environ.get("NV"):
-    return "NV"
   if os.environ.get("CUDA") or os.environ.get("GPU"):
+    _set_cuda_ptx()
     return "CUDA"
-  # Auto-detect via nvidia-smi
   try:
     r = subprocess.run(["nvidia-smi"], capture_output=True, timeout=5)
     if r.returncode == 0:
-      os.environ["NV"] = "1"
-      return "NV"
+      os.environ["CUDA"] = "1"
+      _set_cuda_ptx()
+      return "CUDA"
   except (FileNotFoundError, subprocess.TimeoutExpired):
     pass
   return "CLANG"
+
+
+def _set_cuda_ptx():
+  """Use PTXCompiler to bypass nvrtc arch validation."""
+  if not os.environ.get("CUDA_PTX") and not os.environ.get("CUDA_CC"):
+    os.environ["CUDA_PTX"] = "1"
 
 DEVICE = _detect_device()
 

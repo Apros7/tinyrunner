@@ -118,6 +118,13 @@ class Trainer:
   def train(self):
     notify("RF-DETR training started")
     tqdm.write(f"Training RF-DETR for {self.epochs} epochs, batch={self.batch_size}, lr={self.lr}")
+    import os
+    if os.environ.get("CUDA_PTX"):
+      tqdm.write(
+        "  Note: CUDA_PTX=1 — CUDA driver will JIT-compile GPU kernels on the first batch.\n"
+        "  This is a one-time cost (~2-5 min for this model) cached in ~/.nv/ComputeCache/.\n"
+        "  GPU utilization in nvidia-smi will be 0%% during compilation, then jump to ~100%%."
+      )
     best_map = 0.0
     epoch_times = []
     t_train_start = time.time()
