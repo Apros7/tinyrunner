@@ -1,8 +1,16 @@
 """Trainer for RF-DETR."""
-import time, os, math
+import time, os, math, sys
 from tinygrad import Tensor, nn
 from tinygrad.nn import state as nn_state
 from .notify import notify
+
+
+def _fmt_time(seconds):
+  """Format seconds as m:ss or h:mm:ss."""
+  seconds = int(seconds)
+  h, rem = divmod(seconds, 3600)
+  m, s = divmod(rem, 60)
+  return f"{h}:{m:02d}:{s:02d}" if h else f"{m}:{s:02d}"
 
 class Trainer:
   def __init__(self, model, criterion, train_ds, val_ds=None,
@@ -58,22 +66,22 @@ class Trainer:
     from .data import make_loader
     loader = make_loader(dataset, self.batch_size, shuffle=training)
     total_loss = 0.0; steps = 0; n = len(dataset) // self.batch_size
+    t_epoch = time.time(); t_step = time.time()
     for imgs, targets in loader:
       if steps >= n: break
       if training:
         self._step()
-        # Pass 1: eval mode to get numpy preds for matching (realizes intermediates — OK, no grad needed)
+        # Pass 1: eval mode to get numpy preds for matching
         with Tensor.train(False):
           boxes_m, logits_m = self.model(imgs)
         pb = boxes_m.numpy(); pl = logits_m.numpy()
         matches = self.criterion.compute_matches(pb, pl, targets)
-        # Pass 2: fresh forward in train mode — no .numpy() on outputs before backward
+        # Pass 2: fresh forward in train mode → backward → step
         with Tensor.train():
           boxes, logits = self.model(imgs)
           loss, sub = self.criterion(boxes, logits, targets, matches=matches, match_pb=pb)
           loss.backward()
           self._update()
-        # Realize after backward+step to avoid breaking computation graph
         loss_val = float(loss.numpy())
         sub_vals = {k: float(v.numpy()) for k, v in sub.items()}
       else:
@@ -82,18 +90,34 @@ class Trainer:
           loss, sub = self.criterion(boxes, logits, targets)
         loss_val = float(loss.numpy())
         sub_vals = {k: float(v.numpy()) for k, v in sub.items()}
+
       total_loss += loss_val; steps += 1
-      if steps % 20 == 0:
-        print(f"  step {steps}/{n}  loss={total_loss/steps:.4f}  "
-              f"cls={sub_vals['cls']:.4f} box={sub_vals['box']:.4f} giou={sub_vals['giou']:.4f}", flush=True)
+      now = time.time()
+      step_time = now - t_step; t_step = now
+      elapsed = now - t_epoch
+      avg_step = elapsed / steps
+      eta_epoch = avg_step * (n - steps)
+      imgs_per_sec = self.batch_size / max(step_time, 1e-6)
+      tag = "train" if training else "val"
+      print(
+        f"  {tag} {steps:>{len(str(n))}}/{n}"
+        f"  loss={total_loss/steps:.4f}"
+        f"  cls={sub_vals['cls']:.3f} box={sub_vals['box']:.3f} giou={sub_vals['giou']:.3f}"
+        f"  {imgs_per_sec:.1f}img/s"
+        f"  eta {_fmt_time(eta_epoch)}",
+        flush=True,
+      )
     return total_loss / max(1, steps)
 
   def train(self):
-    notify("🚀 RF-DETR training started")
+    notify("RF-DETR training started")
     print(f"Training RF-DETR for {self.epochs} epochs, batch={self.batch_size}, lr={self.lr}", flush=True)
     best_map = 0.0
+    epoch_times = []
+    t_train_start = time.time()
     for epoch in range(1, self.epochs+1):
       t0 = time.time()
+      print(f"\nEpoch {epoch}/{self.epochs}", flush=True)
       train_loss = self._epoch(self.train_ds, training=True)
       val_str = ""; map_str = ""
       if self.val_ds:
@@ -111,13 +135,26 @@ class Trainer:
         elif val_loss < self.best_loss:
           self.best_loss = val_loss
           self.model.save(os.path.join(self.save_dir, "best.safetensors"))
+      else:
+        if train_loss < self.best_loss:
+          self.best_loss = train_loss
+          self.model.save(os.path.join(self.save_dir, "best.safetensors"))
 
       self.model.save(os.path.join(self.save_dir, "last.safetensors"))
-      print(f"Epoch {epoch}/{self.epochs}  train={train_loss:.4f}{val_str}{map_str}  {time.time()-t0:.1f}s", flush=True)
+      epoch_time = time.time() - t0
+      epoch_times.append(epoch_time)
+      avg_epoch = sum(epoch_times) / len(epoch_times)
+      eta_total = avg_epoch * (self.epochs - epoch)
+      print(
+        f"  --> epoch {epoch}/{self.epochs}  train={train_loss:.4f}{val_str}{map_str}"
+        f"  {epoch_time:.0f}s/epoch  eta {_fmt_time(eta_total)}",
+        flush=True,
+      )
 
       if epoch % 10 == 0 or epoch == self.epochs:
         notify(f"RF-DETR epoch {epoch}/{self.epochs}: train={train_loss:.4f}{val_str}{map_str}")
 
+    total_time = time.time() - t_train_start
     summary = f"best_map={best_map:.4f}" if self.eval_map else f"best_loss={self.best_loss:.4f}"
-    notify(f"✅ RF-DETR training done. {summary}")
+    notify(f"RF-DETR training done. {summary}  total={_fmt_time(total_time)}")
     return best_map if self.eval_map else self.best_loss
