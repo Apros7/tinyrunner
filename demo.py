@@ -9,32 +9,33 @@ tinyrunner demo — train RF-DETR, evaluate mAP, compare against benchmarks.
 import argparse, os, sys, time, subprocess, urllib.request, zipfile, shutil
 import numpy as np
 
-# ── CUDA auto-detection (must happen before tinygrad import) ──────────────────
+# ── GPU auto-detection (must happen before tinygrad import) ───────────────────
 def _detect_device():
+  """Detect NVIDIA GPU and set the best tinygrad backend.
+
+  Prefers NV=1 over CUDA=1.  The NV backend (ops_nv.py) uses tinygrad's
+  direct-hardware NVIDIA path: it queries GPU arch from hardware registers
+  (not the CUDA driver), handles newer GPU variants correctly, and runs
+  kernels via direct memory-mapped queues — all of which show up as real
+  GPU utilization in nvidia-smi.
+
+  Falls back to CUDA=1 if the user set it explicitly, and to CLANG on
+  non-NVIDIA systems.
+  """
+  # Respect explicit user choice
+  if os.environ.get("NV"):
+    return "NV"
   if os.environ.get("CUDA") or os.environ.get("GPU"):
-    _ensure_cuda_ptx()
     return "CUDA"
+  # Auto-detect via nvidia-smi
   try:
     r = subprocess.run(["nvidia-smi"], capture_output=True, timeout=5)
     if r.returncode == 0:
-      os.environ["CUDA"] = "1"
-      _ensure_cuda_ptx()
-      return "CUDA"
+      os.environ["NV"] = "1"
+      return "NV"
   except (FileNotFoundError, subprocess.TimeoutExpired):
     pass
   return "CLANG"
-
-
-def _ensure_cuda_ptx():
-  """Set CUDA_PTX=1 unless the user has already set a compiler preference.
-
-  tinygrad's default CUDA path uses nvrtc to compile to SASS, but nvrtc may
-  reject the GPU's arch string (e.g. sm_100 on older CUDA toolkits).
-  CUDA_PTX=1 bypasses nvrtc: tinygrad emits PTX text, which the CUDA driver
-  JIT-compiles at load time.  Works on all CUDA-capable GPUs.
-  """
-  if not os.environ.get("CUDA_PTX") and not os.environ.get("CUDA_CC"):
-    os.environ["CUDA_PTX"] = "1"
 
 DEVICE = _detect_device()
 

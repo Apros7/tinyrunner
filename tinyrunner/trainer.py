@@ -63,15 +63,16 @@ class Trainer:
     self.step_n += 1
     self._set_lr(self.step_n)
 
-  def _epoch(self, dataset, training):
+  def _epoch(self, dataset, training, epoch_bar=None):
     from .data import make_loader
     loader = make_loader(dataset, self.batch_size, shuffle=training)
     n = len(dataset) // self.batch_size
     total_loss = 0.0; steps = 0
-    tag = "train" if training else "val"
-    bar = tqdm(total=n, desc=f"  {tag}", unit="batch",
-               bar_format="{l_bar}{bar}| {n_fmt}/{total_fmt} [{elapsed}<{remaining}, {rate_fmt}{postfix}]",
-               dynamic_ncols=True, leave=True)
+    tag = "train" if training else "val  "
+    # Inner step bar — leave=False so it erases itself when done, keeping the epoch bar clean
+    step_bar = tqdm(total=n, desc=f"    {tag}", unit="step",
+                    bar_format="{l_bar}{bar}| {n_fmt}/{total_fmt} [{elapsed}<{remaining}, {rate_fmt}{postfix}]",
+                    dynamic_ncols=True, leave=False, position=1)
     t_step = time.time()
     for imgs, targets in loader:
       if steps >= n: break
@@ -98,34 +99,40 @@ class Trainer:
       total_loss += loss_val; steps += 1
       step_time = time.time() - t_step; t_step = time.time()
       imgs_per_sec = self.batch_size / max(step_time, 1e-6)
-      bar.set_postfix(
+      step_bar.set_postfix(
         loss=f"{total_loss/steps:.4f}",
         cls=f"{sub_vals['cls']:.3f}",
         box=f"{sub_vals['box']:.3f}",
         giou=f"{sub_vals['giou']:.3f}",
         img_s=f"{imgs_per_sec:.1f}",
       )
-      bar.update(1)
-    bar.close()
+      step_bar.update(1)
+      if epoch_bar is not None:
+        epoch_bar.set_postfix(
+          loss=f"{total_loss/steps:.4f}",
+          img_s=f"{imgs_per_sec:.1f}",
+        )
+    step_bar.close()
     return total_loss / max(1, steps)
 
   def train(self):
     notify("RF-DETR training started")
-    print(f"Training RF-DETR for {self.epochs} epochs, batch={self.batch_size}, lr={self.lr}", flush=True)
+    tqdm.write(f"Training RF-DETR for {self.epochs} epochs, batch={self.batch_size}, lr={self.lr}")
     best_map = 0.0
     epoch_times = []
     t_train_start = time.time()
+
+    # Outer epoch bar at position=0, stays visible throughout
+    epoch_bar = tqdm(total=self.epochs, desc="  epochs", unit="ep",
+                     bar_format="{l_bar}{bar}| {n_fmt}/{total_fmt} [{elapsed}<{remaining}, {rate_fmt}{postfix}]",
+                     dynamic_ncols=True, leave=True, position=0)
+
     for epoch in range(1, self.epochs+1):
       t0 = time.time()
-      if epoch_times:
-        avg_so_far = sum(epoch_times) / len(epoch_times)
-        print(f"\nEpoch {epoch}/{self.epochs}  (eta: {_fmt_time(avg_so_far * (self.epochs - epoch + 1))})", flush=True)
-      else:
-        print(f"\nEpoch {epoch}/{self.epochs}", flush=True)
-      train_loss = self._epoch(self.train_ds, training=True)
+      train_loss = self._epoch(self.train_ds, training=True, epoch_bar=epoch_bar)
       val_str = ""; map_str = ""
       if self.val_ds:
-        val_loss = self._epoch(self.val_ds, training=False)
+        val_loss = self._epoch(self.val_ds, training=False, epoch_bar=epoch_bar)
         val_str = f"  val={val_loss:.4f}"
         if self.eval_map:
           from .eval import evaluate
@@ -149,15 +156,19 @@ class Trainer:
       epoch_times.append(epoch_time)
       avg_epoch = sum(epoch_times) / len(epoch_times)
       eta_total = avg_epoch * (self.epochs - epoch)
-      print(
-        f"  --> epoch {epoch}/{self.epochs}  train={train_loss:.4f}{val_str}{map_str}"
-        f"  {epoch_time:.0f}s/epoch  eta {_fmt_time(eta_total)}",
-        flush=True,
+
+      tqdm.write(
+        f"  epoch {epoch:>{len(str(self.epochs))}}/{self.epochs}"
+        f"  train={train_loss:.4f}{val_str}{map_str}"
+        f"  {epoch_time:.0f}s  eta {_fmt_time(eta_total)}"
       )
+      epoch_bar.update(1)
+      epoch_bar.set_postfix(train=f"{train_loss:.4f}", eta=_fmt_time(eta_total))
 
       if epoch % 10 == 0 or epoch == self.epochs:
         notify(f"RF-DETR epoch {epoch}/{self.epochs}: train={train_loss:.4f}{val_str}{map_str}")
 
+    epoch_bar.close()
     total_time = time.time() - t_train_start
     summary = f"best_map={best_map:.4f}" if self.eval_map else f"best_loss={self.best_loss:.4f}"
     notify(f"RF-DETR training done. {summary}  total={_fmt_time(total_time)}")
