@@ -1,3 +1,4 @@
 tinygrad>=0.12.0
 numpy
 pillow
+tqdm

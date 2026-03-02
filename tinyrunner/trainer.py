@@ -1,7 +1,8 @@
 """Trainer for RF-DETR."""
-import time, os, math, sys
+import time, os, math
 from tinygrad import Tensor, nn
 from tinygrad.nn import state as nn_state
+from tqdm import tqdm
 from .notify import notify
 
 
@@ -65,18 +66,21 @@ class Trainer:
   def _epoch(self, dataset, training):
     from .data import make_loader
     loader = make_loader(dataset, self.batch_size, shuffle=training)
-    total_loss = 0.0; steps = 0; n = len(dataset) // self.batch_size
-    t_epoch = time.time(); t_step = time.time()
+    n = len(dataset) // self.batch_size
+    total_loss = 0.0; steps = 0
+    tag = "train" if training else "val"
+    bar = tqdm(total=n, desc=f"  {tag}", unit="batch",
+               bar_format="{l_bar}{bar}| {n_fmt}/{total_fmt} [{elapsed}<{remaining}, {rate_fmt}{postfix}]",
+               dynamic_ncols=True, leave=True)
+    t_step = time.time()
     for imgs, targets in loader:
       if steps >= n: break
       if training:
         self._step()
-        # Pass 1: eval mode to get numpy preds for matching
         with Tensor.train(False):
           boxes_m, logits_m = self.model(imgs)
         pb = boxes_m.numpy(); pl = logits_m.numpy()
         matches = self.criterion.compute_matches(pb, pl, targets)
-        # Pass 2: fresh forward in train mode → backward → step
         with Tensor.train():
           boxes, logits = self.model(imgs)
           loss, sub = self.criterion(boxes, logits, targets, matches=matches, match_pb=pb)
@@ -92,21 +96,17 @@ class Trainer:
         sub_vals = {k: float(v.numpy()) for k, v in sub.items()}
 
       total_loss += loss_val; steps += 1
-      now = time.time()
-      step_time = now - t_step; t_step = now
-      elapsed = now - t_epoch
-      avg_step = elapsed / steps
-      eta_epoch = avg_step * (n - steps)
+      step_time = time.time() - t_step; t_step = time.time()
       imgs_per_sec = self.batch_size / max(step_time, 1e-6)
-      tag = "train" if training else "val"
-      print(
-        f"  {tag} {steps:>{len(str(n))}}/{n}"
-        f"  loss={total_loss/steps:.4f}"
-        f"  cls={sub_vals['cls']:.3f} box={sub_vals['box']:.3f} giou={sub_vals['giou']:.3f}"
-        f"  {imgs_per_sec:.1f}img/s"
-        f"  eta {_fmt_time(eta_epoch)}",
-        flush=True,
+      bar.set_postfix(
+        loss=f"{total_loss/steps:.4f}",
+        cls=f"{sub_vals['cls']:.3f}",
+        box=f"{sub_vals['box']:.3f}",
+        giou=f"{sub_vals['giou']:.3f}",
+        img_s=f"{imgs_per_sec:.1f}",
       )
+      bar.update(1)
+    bar.close()
     return total_loss / max(1, steps)
 
   def train(self):
@@ -117,7 +117,11 @@ class Trainer:
     t_train_start = time.time()
     for epoch in range(1, self.epochs+1):
       t0 = time.time()
-      print(f"\nEpoch {epoch}/{self.epochs}", flush=True)
+      if epoch_times:
+        avg_so_far = sum(epoch_times) / len(epoch_times)
+        print(f"\nEpoch {epoch}/{self.epochs}  (eta: {_fmt_time(avg_so_far * (self.epochs - epoch + 1))})", flush=True)
+      else:
+        print(f"\nEpoch {epoch}/{self.epochs}", flush=True)
       train_loss = self._epoch(self.train_ds, training=True)
       val_str = ""; map_str = ""
       if self.val_ds:
