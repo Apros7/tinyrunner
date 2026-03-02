@@ -33,6 +33,8 @@ def parse_args():
   p.add_argument("--val-split",   default="valid", help="Validation split name (YOLO format)")
   p.add_argument("--device",      default=None,
                  help="Backend device (e.g. CLANG, CUDA, PYTHON). Auto-detected if not set.")
+  p.add_argument("--eval-map",    action="store_true", default=False,
+                 help="Compute mAP@0.5 on val set after each epoch (slower)")
   return p.parse_args()
 
 def main():
@@ -84,6 +86,7 @@ def main():
     img_size=args.img_size,
     save_dir=args.save_dir,
     pretrained_backbone=args.pretrained,
+    eval_map=args.eval_map,
   )
 
   trainer.train()

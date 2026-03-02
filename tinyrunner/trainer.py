@@ -7,11 +7,13 @@ from .notify import notify
 class Trainer:
   def __init__(self, model, criterion, train_ds, val_ds=None,
                lr=1e-4, batch_size=4, epochs=50, img_size=640,
-               save_dir="runs", pretrained_backbone=True, warmup_epochs=2):
+               save_dir="runs", pretrained_backbone=True, warmup_epochs=2,
+               eval_map=False):
     self.model = model; self.criterion = criterion
     self.train_ds = train_ds; self.val_ds = val_ds
     self.epochs = epochs; self.batch_size = batch_size
-    self.save_dir = save_dir; self.lr = lr
+    self.save_dir = save_dir; self.lr = lr; self.img_size = img_size
+    self.eval_map = eval_map
     os.makedirs(save_dir, exist_ok=True)
 
     # Separate backbone (lower LR) and head parameters
@@ -88,23 +90,34 @@ class Trainer:
 
   def train(self):
     notify("🚀 RF-DETR training started")
-    print(f"Training RF-DETR for {self.epochs} epochs, batch={self.batch_size}, lr={self.lr}")
+    print(f"Training RF-DETR for {self.epochs} epochs, batch={self.batch_size}, lr={self.lr}", flush=True)
+    best_map = 0.0
     for epoch in range(1, self.epochs+1):
       t0 = time.time()
       train_loss = self._epoch(self.train_ds, training=True)
-      val_str = ""
+      val_str = ""; map_str = ""
       if self.val_ds:
         val_loss = self._epoch(self.val_ds, training=False)
         val_str = f"  val={val_loss:.4f}"
-        if val_loss < self.best_loss:
+        if self.eval_map:
+          from .eval import evaluate
+          res = evaluate(self.model, self.val_ds,
+                         num_classes=self.criterion.num_classes,
+                         img_size=self.img_size, batch_size=self.batch_size)
+          map_str = f"  mAP={res['mAP']:.4f}"
+          if res['mAP'] > best_map:
+            best_map = res['mAP']
+            self.model.save(os.path.join(self.save_dir, "best.safetensors"))
+        elif val_loss < self.best_loss:
           self.best_loss = val_loss
           self.model.save(os.path.join(self.save_dir, "best.safetensors"))
 
       self.model.save(os.path.join(self.save_dir, "last.safetensors"))
-      print(f"Epoch {epoch}/{self.epochs}  train={train_loss:.4f}{val_str}  {time.time()-t0:.1f}s", flush=True)
+      print(f"Epoch {epoch}/{self.epochs}  train={train_loss:.4f}{val_str}{map_str}  {time.time()-t0:.1f}s", flush=True)
 
       if epoch % 10 == 0 or epoch == self.epochs:
-        notify(f"RF-DETR epoch {epoch}/{self.epochs}: train={train_loss:.4f}{val_str}")
+        notify(f"RF-DETR epoch {epoch}/{self.epochs}: train={train_loss:.4f}{val_str}{map_str}")
 
-    notify(f"✅ RF-DETR training done. Best loss: {self.best_loss:.4f}")
-    return self.best_loss
+    summary = f"best_map={best_map:.4f}" if self.eval_map else f"best_loss={self.best_loss:.4f}"
+    notify(f"✅ RF-DETR training done. {summary}")
+    return best_map if self.eval_map else self.best_loss
