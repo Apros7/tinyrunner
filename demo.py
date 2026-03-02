@@ -11,32 +11,101 @@ import numpy as np
 
 # ── CUDA auto-detection (must happen before tinygrad import) ──────────────────
 def _detect_device():
-  """Detect NVIDIA GPU and configure tinygrad's CUDA backend.
-
-  Sets CUDA_PTX=1 so tinygrad uses PTXCompiler (pure Python text substitution)
-  instead of nvrtc.  nvrtc rejects newer GPU arch strings (e.g. sm_100 for
-  Blackwell) on older CUDA toolkits.  PTXCompiler produces PTX text which is
-  handed directly to the CUDA *driver* via cuModuleLoadData — the driver always
-  supports its own GPU and JIT-compiles the PTX at first use, caching the
-  result in ~/.nv/ComputeCache/ for all subsequent runs.
-  """
   if os.environ.get("CUDA") or os.environ.get("GPU"):
-    _set_cuda_ptx()
     return "CUDA"
   try:
     r = subprocess.run(["nvidia-smi"], capture_output=True, timeout=5)
     if r.returncode == 0:
       os.environ["CUDA"] = "1"
-      _set_cuda_ptx()
       return "CUDA"
   except (FileNotFoundError, subprocess.TimeoutExpired):
     pass
   return "CLANG"
 
 
-def _set_cuda_ptx():
-  """Use PTXCompiler to bypass nvrtc arch validation."""
-  if not os.environ.get("CUDA_PTX") and not os.environ.get("CUDA_CC"):
+def _nvrtc_test(libnvrtc, arch):
+  """Return True if nvrtc can compile a trivial kernel for arch."""
+  import ctypes
+  src = b'extern "C" __global__ void k() {}'
+  prog = ctypes.c_void_p()
+  libnvrtc.nvrtcCreateProgram(ctypes.byref(prog), src, b"k.cu", 0, None, None)
+  opt = f"--gpu-architecture={arch}".encode()
+  status = libnvrtc.nvrtcCompileProgram(prog, 1, (ctypes.c_char_p * 1)(opt))
+  libnvrtc.nvrtcDestroyProgram(ctypes.byref(prog))
+  return status == 0
+
+
+def _find_nvrtc_fallback():
+  """
+  Test if nvrtc supports the GPU's native arch.  If not, return the highest
+  virtual arch (compute_XX) that nvrtc does support.
+
+  Virtual archs produce forward-compatible PTX that runs on any newer GPU.
+  nvrtc compiles these in milliseconds — no slow CUDA-driver JIT needed.
+
+  Returns (gpu_arch, effective_arch) where effective_arch may differ from
+  gpu_arch when a fallback is needed, or (None, None) on failure.
+  """
+  import ctypes
+  try:
+    for libname in ("libcuda.so.1", "libcuda.so"):
+      try: libcuda = ctypes.CDLL(libname); break
+      except OSError: pass
+    else: return None, None
+    if libcuda.cuInit(0) != 0: return None, None
+    major, minor = ctypes.c_int(), ctypes.c_int()
+    libcuda.cuDeviceGetAttribute(ctypes.byref(major), 75, ctypes.c_int(0))
+    libcuda.cuDeviceGetAttribute(ctypes.byref(minor), 76, ctypes.c_int(0))
+    gpu_arch = f"sm_{major.value}{minor.value}"
+  except Exception:
+    return None, None
+
+  try:
+    for libname in ("libnvrtc.so.1", "libnvrtc.so.12", "libnvrtc.so"):
+      try: libnvrtc = ctypes.CDLL(libname); break
+      except OSError: pass
+    else: return gpu_arch, None
+    if _nvrtc_test(libnvrtc, gpu_arch):
+      return gpu_arch, gpu_arch   # nvrtc supports this GPU natively
+    # Try virtual archs (forward-compatible PTX, works on any newer GPU)
+    for va in ("compute_90", "compute_89", "compute_87", "compute_86", "compute_80", "compute_75"):
+      if _nvrtc_test(libnvrtc, va):
+        return gpu_arch, va
+  except Exception:
+    pass
+  return gpu_arch, None  # Nothing works → caller falls back to CUDA_PTX
+
+
+def _patch_cuda_compiler(effective_arch):
+  """Monkey-patch CUDACompiler to use effective_arch instead of detected GPU arch."""
+  try:
+    from tinygrad.runtime.support.compiler_cuda import CUDACompiler
+    orig = CUDACompiler.__init__
+    def _patched(self, arch, cache_key="cuda"):
+      orig(self, effective_arch, cache_key)
+    CUDACompiler.__init__ = _patched
+    return True
+  except Exception:
+    return False
+
+
+def _configure_cuda():
+  """Called in main() after tinygrad is imported, before any tensor ops."""
+  if os.environ.get("CUDA_PTX") or os.environ.get("CUDA_CC"):
+    return  # user already set something
+  gpu_arch, effective_arch = _find_nvrtc_fallback()
+  if gpu_arch is None:
+    return  # couldn't probe, leave defaults
+  if effective_arch == gpu_arch:
+    print(f"  nvrtc: native {gpu_arch}", flush=True)
+    return  # nvrtc works natively, nothing to do
+  if effective_arch is not None:
+    print(f"  nvrtc: {gpu_arch} unsupported, patching to {effective_arch}", flush=True)
+    if not _patch_cuda_compiler(effective_arch):
+      print(f"  patch failed, falling back to CUDA_PTX=1 (slow first batch)", flush=True)
+      os.environ["CUDA_PTX"] = "1"
+  else:
+    print(f"  nvrtc: no compatible arch found, using CUDA_PTX=1 (slow first batch)", flush=True)
     os.environ["CUDA_PTX"] = "1"
 
 DEVICE = _detect_device()
@@ -210,6 +279,8 @@ def main():
   from tinyrunner.data import load_dataset, make_loader
   from tinyrunner.model import RFDETR
   from tinyrunner.loss import SetCriterion
+  if device == "CUDA":
+    _configure_cuda()  # patch nvrtc arch if needed, before any tensor ops
   from tinyrunner.trainer import Trainer
   from tinyrunner.eval import evaluate
   from tinyrunner.notify import notify
