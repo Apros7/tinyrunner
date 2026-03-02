@@ -2,52 +2,109 @@
 """
 tinyrunner demo — train RF-DETR, evaluate mAP, compare against benchmarks.
 
-Usage:
-  python demo.py --data /path/to/yolo_dataset [--epochs 20] [--batch 4]
-                 [--img-size 640] [--save-dir demo_out]
-                 [--compare-ultralytics]
-
-Quick smoke-test with a synthetic dataset:
-  python demo.py --data auto --epochs 2 --img-size 64 --batch 2
+  uv run demo.py                          # downloads COCO128, auto-detects CUDA
+  uv run demo.py --data /my/dataset       # your own YOLO dataset
+  uv run demo.py --epochs 50 --batch 8    # more training
 """
-import argparse, os, sys, time, math, tempfile
+import argparse, os, sys, time, subprocess, urllib.request, zipfile, shutil
 import numpy as np
 
+# ── CUDA auto-detection (must happen before tinygrad import) ──────────────────
+def _detect_device():
+  if os.environ.get("CUDA") or os.environ.get("GPU"):
+    return "CUDA"
+  try:
+    r = subprocess.run(["nvidia-smi"], capture_output=True, timeout=5)
+    if r.returncode == 0:
+      os.environ["CUDA"] = "1"
+      return "CUDA"
+  except (FileNotFoundError, subprocess.TimeoutExpired):
+    pass
+  return "CLANG"
+
+DEVICE = _detect_device()
+
 # ── Published benchmark reference numbers ─────────────────────────────────────
-# Source: RF-DETR paper (Roboflow, 2024) and Ultralytics docs
 PUBLISHED = [
-  {"model": "RF-DETR-B (paper)",  "mAP_COCO": 53.4, "params_M": 29,    "note": "COCO val2017, 640px"},
-  {"model": "RF-DETR-L (paper)",  "mAP_COCO": 62.1, "params_M": 128,   "note": "COCO val2017, 1024px"},
-  {"model": "YOLOv8n (ultralytics)", "mAP_COCO": 37.3, "params_M": 3.2,  "note": "COCO val2017, 640px"},
-  {"model": "YOLOv8s (ultralytics)", "mAP_COCO": 44.9, "params_M": 11.2, "note": "COCO val2017, 640px"},
-  {"model": "YOLOv8l (ultralytics)", "mAP_COCO": 52.9, "params_M": 43.7, "note": "COCO val2017, 640px"},
-  {"model": "RT-DETR-R50 (paper)",   "mAP_COCO": 53.1, "params_M": 42,   "note": "COCO val2017, 640px"},
+  {"model": "RF-DETR-B (paper)",     "mAP@0.5": 70.4, "params": "29M",  "note": "COCO val2017, 640px"},
+  {"model": "RF-DETR-L (paper)",     "mAP@0.5": 77.5, "params": "128M", "note": "COCO val2017, 1024px"},
+  {"model": "RT-DETR-R50 (paper)",   "mAP@0.5": 69.6, "params": "42M",  "note": "COCO val2017, 640px"},
+  {"model": "YOLOv8n (ultralytics)", "mAP@0.5": 52.9, "params": "3.2M", "note": "COCO val2017, 640px"},
+  {"model": "YOLOv8s (ultralytics)", "mAP@0.5": 61.8, "params": "11M",  "note": "COCO val2017, 640px"},
+  {"model": "YOLOv8l (ultralytics)", "mAP@0.5": 70.1, "params": "44M",  "note": "COCO val2017, 640px"},
 ]
 
+COCO128_URL  = "https://ultralytics.com/assets/coco128.zip"
+COCO128_DIR  = os.path.join(os.path.dirname(__file__), "demo_data", "coco128")
 
-# ── Helpers ───────────────────────────────────────────────────────────────────
 
-def _make_demo_dataset(root, n_train=16, n_val=8, num_classes=2, img_size=64):
-  """Create a tiny synthetic YOLO-format dataset for smoke-testing."""
-  from PIL import Image
-  for split, n in [("train", n_train), ("valid", n_val)]:
-    os.makedirs(f"{root}/{split}/images", exist_ok=True)
-    os.makedirs(f"{root}/{split}/labels", exist_ok=True)
-  rng = np.random.default_rng(42)
-  for split, n in [("train", n_train), ("valid", n_val)]:
-    for i in range(n):
-      img = rng.integers(0, 255, (img_size, img_size, 3), dtype=np.uint8)
-      Image.fromarray(img).save(f"{root}/{split}/images/img{i:04d}.jpg")
-      cls = rng.integers(0, num_classes)
-      cx, cy = rng.uniform(0.2, 0.8, 2)
-      w, h = rng.uniform(0.1, 0.3, 2)
-      with open(f"{root}/{split}/labels/img{i:04d}.txt", "w") as f:
-        f.write(f"{cls} {cx:.4f} {cy:.4f} {w:.4f} {h:.4f}\n")
-  with open(f"{root}/data.yaml", "w") as f:
-    names = [f"class{i}" for i in range(num_classes)]
-    f.write(f"nc: {num_classes}\nnames: {names}\n")
-  return num_classes
+# ── Dataset helpers ───────────────────────────────────────────────────────────
 
+def _download_coco128():
+  """Download and unpack COCO128 (~7MB) the first time. Returns dataset path."""
+  if os.path.isdir(COCO128_DIR):
+    return COCO128_DIR
+  print("Downloading COCO128 demo dataset (~7MB)...", flush=True)
+  os.makedirs(os.path.dirname(COCO128_DIR), exist_ok=True)
+  zip_path = COCO128_DIR + ".zip"
+  urllib.request.urlretrieve(COCO128_URL, zip_path,
+    reporthook=lambda b, bs, total: print(
+      f"  {min(b*bs, total)/1e6:.1f}/{total/1e6:.1f} MB\r", end="", flush=True) if total > 0 else None)
+  print()
+  with zipfile.ZipFile(zip_path) as z:
+    z.extractall(os.path.dirname(COCO128_DIR))
+  os.rename(os.path.join(os.path.dirname(COCO128_DIR), "coco128"), COCO128_DIR)
+  os.remove(zip_path)
+  # COCO128 uses 'images/train2017' — create data.yaml if missing
+  yaml_path = os.path.join(COCO128_DIR, "data.yaml")
+  if not os.path.exists(yaml_path):
+    _write_coco128_yaml(yaml_path)
+  print(f"  Saved to {COCO128_DIR}", flush=True)
+  return COCO128_DIR
+
+
+def _write_coco128_yaml(yaml_path):
+  names = ["person","bicycle","car","motorcycle","airplane","bus","train","truck",
+           "boat","traffic light","fire hydrant","stop sign","parking meter","bench",
+           "bird","cat","dog","horse","sheep","cow","elephant","bear","zebra","giraffe",
+           "backpack","umbrella","handbag","tie","suitcase","frisbee","skis","snowboard",
+           "sports ball","kite","baseball bat","baseball glove","skateboard","surfboard",
+           "tennis racket","bottle","wine glass","cup","fork","knife","spoon","bowl",
+           "banana","apple","sandwich","orange","broccoli","carrot","hot dog","pizza",
+           "donut","cake","chair","couch","potted plant","bed","dining table","toilet",
+           "tv","laptop","mouse","remote","keyboard","cell phone","microwave","oven",
+           "toaster","sink","refrigerator","book","clock","vase","scissors","teddy bear",
+           "hair drier","toothbrush"]
+  root = os.path.dirname(yaml_path)
+  # Find train/val splits
+  train_img = None
+  for candidate in ["images/train2017", "images/train", "train/images"]:
+    if os.path.isdir(os.path.join(root, candidate)):
+      train_img = candidate; break
+  val_img = None
+  for candidate in ["images/val2017", "images/val", "valid/images"]:
+    if os.path.isdir(os.path.join(root, candidate)):
+      val_img = candidate; break
+  with open(yaml_path, "w") as f:
+    f.write(f"path: {root}\n")
+    if train_img: f.write(f"train: {train_img}\n")
+    if val_img:   f.write(f"val: {val_img}\n")
+    f.write(f"nc: {len(names)}\n")
+    f.write(f"names: {names}\n")
+
+
+def _find_split(data_path, split_names):
+  """Try multiple split directory names, return dataset or None."""
+  from tinyrunner.data import load_dataset
+  for name in split_names:
+    try:
+      return load_dataset(data_path, split=name, img_size=None, training=False)
+    except Exception:
+      pass
+  return None
+
+
+# ── Table printing ─────────────────────────────────────────────────────────────
 
 def _print_table(rows, headers):
   widths = [max(len(h), max((len(str(r.get(h, ""))) for r in rows), default=0))
@@ -58,122 +115,110 @@ def _print_table(rows, headers):
   print(fmt.format(*headers))
   print(sep)
   for r in rows:
-    print(fmt.format(*[str(r.get(h, "—")) for h in headers]))
+    print(fmt.format(*[str(r.get(h, "")) for h in headers]))
   print(sep)
 
 
 def _param_count(model):
   from tinygrad.nn import state as nn_state
-  return sum(np.prod(p.shape) for p in nn_state.get_parameters(model)) / 1e6
+  return sum(int(np.prod(p.shape)) for p in nn_state.get_parameters(model)) / 1e6
 
 
 # ── Ultralytics comparison ────────────────────────────────────────────────────
 
-def _run_ultralytics(data_path, num_classes, epochs, img_size, batch, save_dir):
-  """Train YOLOv8n on same data and evaluate mAP. Returns mAP float or None."""
+def _run_ultralytics(data_path, epochs, img_size, batch, save_dir):
+  """Train YOLOv8n on the same data and return mAP@0.5, or None if unavailable."""
   try:
     from ultralytics import YOLO
   except ImportError:
-    print("  ultralytics not installed — skipping live comparison")
     return None
 
-  print("\n── Ultralytics YOLOv8n comparison ──────────────────────────────────")
   yaml_path = os.path.join(data_path, "data.yaml")
   if not os.path.exists(yaml_path):
-    print("  No data.yaml found — skipping ultralytics comparison")
     return None
 
-  # Patch data.yaml to include absolute paths if needed
+  print("\n── YOLOv8n comparison (ultralytics) ────────────────────────────────", flush=True)
   yolo_dir = os.path.join(save_dir, "yolo")
   os.makedirs(yolo_dir, exist_ok=True)
-
   model = YOLO("yolov8n.pt")
-  results = model.train(
-    data=yaml_path,
-    epochs=epochs,
-    imgsz=img_size,
-    batch=batch,
-    project=yolo_dir,
-    name="run",
-    verbose=False,
-  )
-  val_results = model.val(data=yaml_path, imgsz=img_size, batch=batch, verbose=False)
-  mAP = float(val_results.box.map50)
+  model.train(data=yaml_path, epochs=epochs, imgsz=img_size, batch=batch,
+              project=yolo_dir, name="run", verbose=False)
+  val_res = model.val(data=yaml_path, imgsz=img_size, batch=batch, verbose=False)
+  mAP = float(val_res.box.map50)
   print(f"  YOLOv8n  mAP@0.5 = {mAP:.4f}", flush=True)
   return mAP
 
 
-# ── Main demo ─────────────────────────────────────────────────────────────────
+# ── CLI ───────────────────────────────────────────────────────────────────────
 
 def parse_args():
-  p = argparse.ArgumentParser(description="tinyrunner demo: train RF-DETR and benchmark")
-  p.add_argument("--data",    default=None,
-                 help="Path to YOLO dataset, or 'auto' to generate a synthetic one")
-  p.add_argument("--epochs",  type=int,   default=20)
-  p.add_argument("--batch",   type=int,   default=4)
-  p.add_argument("--lr",      type=float, default=1e-4)
-  p.add_argument("--img-size",type=int,   default=640)
-  p.add_argument("--save-dir",default="demo_out")
-  p.add_argument("--weights", default=None, help="Resume from .safetensors checkpoint")
-  p.add_argument("--pretrained", action="store_true", default=True)
-  p.add_argument("--no-pretrained", dest="pretrained", action="store_false")
-  p.add_argument("--compare-ultralytics", action="store_true", default=False,
-                 help="Also train YOLOv8n (requires ultralytics package)")
-  p.add_argument("--device",  default=None,
-                 help="Backend (CLANG, CUDA, PYTHON). Auto-detected if not set.")
+  p = argparse.ArgumentParser(
+    description="tinyrunner demo: train RF-DETR, evaluate mAP, compare against benchmarks.",
+    formatter_class=argparse.ArgumentDefaultsHelpFormatter)
+  p.add_argument("--data",     default=None,
+                 help="YOLO dataset path. Omit to auto-download COCO128.")
+  p.add_argument("--epochs",   type=int,   default=20)
+  p.add_argument("--batch",    type=int,   default=8)
+  p.add_argument("--lr",       type=float, default=1e-4)
+  p.add_argument("--img-size", type=int,   default=640)
+  p.add_argument("--save-dir", default="demo_out")
+  p.add_argument("--weights",  default=None, help="Resume from .safetensors checkpoint")
+  p.add_argument("--no-pretrained", dest="pretrained", action="store_false", default=True,
+                 help="Skip pretrained ResNet-50 backbone")
+  p.add_argument("--device",   default=None,
+                 help="Force backend: CLANG, CUDA, PYTHON (auto-detected by default)")
   return p.parse_args()
 
+
+# ── Main ──────────────────────────────────────────────────────────────────────
 
 def main():
   args = parse_args()
 
+  # Device — CLI overrides auto-detection
   if args.device:
     os.environ[args.device.upper()] = "1"
-
-  # ── Dataset setup ──────────────────────────────────────────────────────────
-  tmpdir = None
-  if args.data is None or args.data.lower() == "auto":
-    print("No dataset provided — generating synthetic demo dataset...")
-    tmpdir = tempfile.mkdtemp(prefix="tinyrunner_demo_")
-    num_classes = _make_demo_dataset(tmpdir, img_size=min(args.img_size, 64))
-    data_path = tmpdir
-    print(f"  Synthetic dataset at {tmpdir}  ({num_classes} classes, 16 train / 8 val)")
+    device = args.device.upper()
   else:
-    data_path = args.data
+    device = DEVICE
+  print(f"Device: {device}", flush=True)
 
-  from tinyrunner.data import load_dataset
+  # Dataset
+  if args.data:
+    data_path = args.data
+  else:
+    data_path = _download_coco128()
+
+  # Now safe to import tinygrad (device env var is set)
+  from tinyrunner.data import load_dataset, make_loader
   from tinyrunner.model import RFDETR
   from tinyrunner.loss import SetCriterion
   from tinyrunner.trainer import Trainer
   from tinyrunner.eval import evaluate
   from tinyrunner.notify import notify
 
-  print(f"\n── Dataset ─────────────────────────────────────────────────────────")
+  # ── Load dataset ────────────────────────────────────────────────────────────
+  print(f"\n── Dataset: {data_path}", flush=True)
   train_ds = load_dataset(data_path, split="train", img_size=args.img_size, training=True)
-  print(f"  train: {len(train_ds)} images, {train_ds.num_classes} classes")
-  val_ds = None
-  try:
-    val_ds = load_dataset(data_path, split="valid", img_size=args.img_size, training=False)
-    print(f"  val:   {len(val_ds)} images")
-  except Exception:
-    try:
-      val_ds = load_dataset(data_path, split="val", img_size=args.img_size, training=False)
-      print(f"  val:   {len(val_ds)} images")
-    except Exception:
-      print("  (no validation split found)")
+  print(f"  train : {len(train_ds)} images, {train_ds.num_classes} classes")
+  val_ds = _find_split(data_path, ["valid", "val", "validation", "test"])
+  if val_ds:
+    print(f"  val   : {len(val_ds)} images")
+  else:
+    print("  val   : not found — will skip evaluation")
 
   num_classes = train_ds.num_classes
 
-  # ── Build model ────────────────────────────────────────────────────────────
-  print(f"\n── Model ───────────────────────────────────────────────────────────")
+  # ── Build model ─────────────────────────────────────────────────────────────
+  print(f"\n── RF-DETR model", flush=True)
   model = RFDETR(num_classes=num_classes)
   if args.weights:
     model.load(args.weights)
-    print(f"  Loaded weights from {args.weights}")
+    print(f"  Loaded: {args.weights}")
   params_M = _param_count(model)
-  print(f"  Parameters: {params_M:.1f}M")
-  print(f"  Classes:    {num_classes}")
-  print(f"  Queries:    300  (default)")
+  print(f"  Params  : {params_M:.1f}M")
+  print(f"  Classes : {num_classes}")
+  print(f"  Queries : 300")
 
   criterion = SetCriterion(num_classes)
   os.makedirs(args.save_dir, exist_ok=True)
@@ -185,85 +230,63 @@ def main():
     epochs=args.epochs, img_size=args.img_size,
     save_dir=args.save_dir,
     pretrained_backbone=args.pretrained,
-    eval_map=False,  # We'll compute mAP ourselves at the end
   )
 
-  # ── Train ──────────────────────────────────────────────────────────────────
-  print(f"\n── Training RF-DETR ({args.epochs} epochs) ──────────────────────────")
-  t_train = time.time()
+  # ── Train ───────────────────────────────────────────────────────────────────
+  print(f"\n── Training ({args.epochs} epochs, batch={args.batch}, lr={args.lr})", flush=True)
+  t0 = time.time()
   trainer.train()
-  train_time = time.time() - t_train
-  print(f"\nTraining took {train_time:.0f}s ({train_time/args.epochs:.0f}s/epoch)", flush=True)
+  train_time = time.time() - t0
+  print(f"\nTraining: {train_time:.0f}s total  ({train_time/args.epochs:.0f}s/epoch)", flush=True)
 
-  # ── Evaluate tinyrunner mAP ────────────────────────────────────────────────
+  # ── Evaluate tinyrunner ──────────────────────────────────────────────────────
   tinyrunner_map = None
   if val_ds is not None:
-    print(f"\n── Evaluating tinyrunner mAP@0.5 ───────────────────────────────────")
-    # Load best weights for evaluation
+    print(f"\n── Evaluating mAP@0.5", flush=True)
     best_path = os.path.join(args.save_dir, "best.safetensors")
     if os.path.exists(best_path):
       model.load(best_path)
-      print(f"  Using best weights: {best_path}")
     res = evaluate(model, val_ds, num_classes=num_classes,
                    img_size=args.img_size, batch_size=args.batch)
     tinyrunner_map = res["mAP"]
-    print(f"  mAP@0.5 = {tinyrunner_map:.4f}")
-    if res["AP"]:
-      print("  Per-class AP:")
-      class_names = getattr(train_ds, "class_names",
-                            {i: f"class{i}" for i in range(num_classes)})
-      for c, ap in res["AP"].items():
-        if res["n_gt"].get(c, 0) > 0:
-          name = class_names.get(c, f"class{c}") if isinstance(class_names, dict) else (
-            class_names[c] if c < len(class_names) else f"class{c}")
-          print(f"    {name:20s}  AP={ap:.4f}  (GT={res['n_gt'][c]}, pred={res['n_pred'][c]})")
+    print(f"  tinyrunner mAP@0.5 = {tinyrunner_map:.4f}")
+    class_names = getattr(train_ds, "class_names", None) or {i: f"cls{i}" for i in range(num_classes)}
+    for c, ap in res["AP"].items():
+      if res["n_gt"].get(c, 0) > 0:
+        name = (class_names[c] if isinstance(class_names, (list, dict))
+                and c < len(class_names) else f"cls{c}")
+        print(f"    {str(name):20s}  AP={ap:.4f}  GT={res['n_gt'][c]}")
 
-  # ── Ultralytics comparison ─────────────────────────────────────────────────
-  ultralytics_map = None
-  if args.compare_ultralytics:
-    ultralytics_map = _run_ultralytics(
-      data_path, num_classes, args.epochs, args.img_size, args.batch, args.save_dir)
+  # ── Ultralytics comparison (automatic if installed) ─────────────────────────
+  ultralytics_map = _run_ultralytics(data_path, args.epochs, args.img_size, args.batch, args.save_dir)
 
-  # ── Results table ──────────────────────────────────────────────────────────
-  print(f"\n── Results ─────────────────────────────────────────────────────────")
+  # ── Results table ────────────────────────────────────────────────────────────
+  print(f"\n── Results", flush=True)
   rows = []
   if tinyrunner_map is not None:
     rows.append({
-      "Model": f"tinyrunner RF-DETR (this, {args.epochs}ep)",
-      "mAP@0.5 (dataset)": f"{tinyrunner_map:.4f}",
+      "Model": f"tinyrunner RF-DETR ({args.epochs} epochs)",
+      "mAP@0.5": f"{tinyrunner_map:.4f}",
       "Params": f"{params_M:.1f}M",
-      "Note": f"{len(train_ds)} train imgs, {args.img_size}px",
+      "Dataset": f"{len(train_ds)} train imgs",
     })
   if ultralytics_map is not None:
     rows.append({
-      "Model": f"YOLOv8n ultralytics ({args.epochs}ep)",
-      "mAP@0.5 (dataset)": f"{ultralytics_map:.4f}",
+      "Model": f"YOLOv8n ultralytics ({args.epochs} epochs)",
+      "mAP@0.5": f"{ultralytics_map:.4f}",
       "Params": "3.2M",
-      "Note": f"{len(train_ds)} train imgs, {args.img_size}px",
+      "Dataset": f"{len(train_ds)} train imgs",
     })
-
-  # Published COCO numbers as context
-  rows.append({"Model": "— COCO benchmarks (published) —", "mAP@0.5 (dataset)": "", "Params": "", "Note": ""})
+  rows.append({"Model": "── published COCO benchmarks ──", "mAP@0.5": "", "Params": "", "Dataset": ""})
   for r in PUBLISHED:
-    rows.append({
-      "Model": r["model"],
-      "mAP@0.5 (dataset)": f"{r['mAP_COCO']}",
-      "Params": f"{r['params_M']}M",
-      "Note": r["note"],
-    })
+    rows.append({"Model": r["model"], "mAP@0.5": str(r["mAP@0.5"]), "Params": r["params"], "Dataset": r["note"]})
 
-  _print_table(rows, ["Model", "mAP@0.5 (dataset)", "Params", "Note"])
+  _print_table(rows, ["Model", "mAP@0.5", "Params", "Dataset"])
 
   if tinyrunner_map is not None:
-    msg = (f"tinyrunner demo done: mAP@0.5={tinyrunner_map:.4f} "
-           f"({args.epochs}ep, {len(train_ds)} imgs)")
-    notify(msg)
+    notify(f"tinyrunner demo: mAP@0.5={tinyrunner_map:.4f}  ({args.epochs}ep, {len(train_ds)} imgs, {device})")
 
-  # Cleanup synthetic dataset
-  if tmpdir:
-    import shutil; shutil.rmtree(tmpdir, ignore_errors=True)
-
-  print(f"\nWeights saved to: {args.save_dir}/")
+  print(f"\nWeights : {args.save_dir}/best.safetensors")
   print("Done.")
 
 
